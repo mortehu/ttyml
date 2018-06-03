@@ -24,6 +24,8 @@
 
 #include "util/curl.h"
 #include "util/string.h"
+#include "util/tty.h"
+#include "util/url.h"
 
 #define NS_PREFIX "https://ttyml.org/2018/05/26|"
 
@@ -41,16 +43,35 @@
 
 namespace ttyml {
 
-const std::unordered_map<std::string, Context::Element> Context::tag_to_element_s{{
-  {NS_PREFIX "line", Element::Line},
-  {NS_PREFIX "prompt", Element::Prompt},
-  {NS_PREFIX "ttyml", Element::Root},
-}};
+const std::unordered_map<std::string, Context::Element>
+    Context::tag_to_element_s{{
+        {NS_PREFIX "form", Element::Form},
+        {NS_PREFIX "line", Element::Line},
+        {NS_PREFIX "prompt", Element::Prompt},
+        {NS_PREFIX "style", Element::Style},
+        {NS_PREFIX "ttyml", Element::Root},
+        {NS_PREFIX "var", Element::Var},
+    }};
 
-Context::Context(const char* url)
+unsigned int parse_color(const char* value) {
+  if (!value || 0 == std::strcmp(value, "default")) return 9;
+
+  char* endptr = nullptr;
+  errno = 0;
+  const auto result = std::strtoul(value, &endptr, 10);
+  if (errno != 0) {
+    throw std::runtime_error{
+        string::cat("invalid color attribute '", value, "'")};
+  }
+
+  return result;
+}
+
+Context::Context(const char* url, const char* method, const char* data)
     : url_{url},
       curl_{curl_easy_init(), curl_easy_cleanup},
-      xml_parser_{nullptr, XML_ParserFree} {
+      xml_parser_{nullptr, XML_ParserFree},
+      action_{url} {
   if (!curl_) throw std::runtime_error{"curl_easy_init() failed"};
 
   curl::string_list headers;
@@ -75,7 +96,7 @@ Context::Context(const char* url)
   curl::setopt(curl_.get(), CURLOPT_HEADERFUNCTION,
                +[](const void* ptr, size_t size, size_t nmemb,
                    void* void_context) -> size_t {
-                 const auto context = static_cast<Context *>(void_context);
+                 const auto context = static_cast<Context*>(void_context);
                  if (!context->wrap_exception(
                          [=] { context->put_header(ptr, size * nmemb); }))
                    return 0;
@@ -87,7 +108,7 @@ Context::Context(const char* url)
       curl_.get(), CURLOPT_WRITEFUNCTION,
       +[](const void* ptr, size_t size, size_t nmemb,
           void* void_context) -> size_t {
-        const auto context = static_cast<Context *>(void_context);
+        const auto context = static_cast<Context*>(void_context);
         if (!context->wrap_exception([=] { context->put(ptr, size * nmemb); }))
           return 0;
         return nmemb;
@@ -103,15 +124,70 @@ Context::Context(const char* url)
     XML_Parse(xml_parser_.get(), nullptr, 0, 1);
     if (pending_exception_) std::rethrow_exception(pending_exception_);
   }
+}
 
-  if (has_prompt_) {
-    std::unique_ptr<char[], decltype(&free)> command{readline(prompt_.c_str()), free};
+std::unique_ptr<Context> Context::next_context() const {
+  if (prompts_.empty()) return nullptr;
+
+  // Loop until we get a valid result.
+  for (;;) {
+    std::string data;
+
+    for (const auto& var : vars_)
+      url::append_key_value(&data, var.first, var.second);
+
+    for (const auto& prompt : prompts_) {
+      // Loop until we get valid input.
+      for (;;) {
+        std::unique_ptr<char[], decltype(&free)> value_buf{
+            readline(prompt.prompt_.c_str()), free};
+        if (!value_buf) return nullptr;
+
+        std::string value{value_buf.get()};
+        string::strip(&value);
+
+        if (!std::regex_match(value, prompt.filter_regex_)) {
+          if (!value.empty()) {
+            if (!prompt.filter_message_.empty()) {
+              std::cerr << prompt.filter_message_ << '\n';
+            } else {
+              std::cerr << "Invalid input.  Must match '"
+                        << prompt.filter_regex_str_ << "'\n";
+            }
+          }
+
+          continue;
+        }
+
+        url::append_key_value(&data, prompt.name_, value);
+
+        break;
+      }
+    }
+
+    try {
+      auto url = url::normalize(action_, url_);
+
+      if (method_ != "POST" && !data.empty()) {
+        const auto q = url.find('?');
+        if (q != std::string::npos) url.erase(q);
+        url.push_back('?');
+        url.append(data);
+        data.clear();
+      }
+
+      return std::make_unique<Context>(url.c_str(), method_.c_str(),
+                                       data.c_str());
+    } catch (std::runtime_error& e) {
+      std::cerr << "Error: " << e.what() << '\n';
+      continue;
+    }
   }
 }
 
 void Context::put_header(const void* buf, size_t size) {
-  std::string line{static_cast<const char *>(buf), size};
-  string::strip_right(line);
+  std::string line{static_cast<const char*>(buf), size};
+  string::strip_right(&line);
   if (line.empty()) return;
 
   if (status_message_.empty()) {
@@ -144,14 +220,14 @@ void Context::put_header(const void* buf, size_t size) {
 
   if (key == "content-type") {
     auto data = string::split<std::vector<std::string>>(line.substr(i), ';');
-    for (auto &d : data) string::strip(d);
+    for (auto& d : data) string::strip(&d);
     if (data.empty()) return;
 
     mime_type_ = data[0];
-    string::to_lower(mime_type_);
+    string::ascii_tolower(&mime_type_);
 
     for (size_t i = 1; i < data.size(); ++i) {
-      string::to_lower(data[i]);
+      string::ascii_tolower(&data[i]);
       if (string::starts_with(data[i], "charset="))
         charset_ = data[i].substr(8);
     }
@@ -176,7 +252,7 @@ void Context::put(const void* buf, size_t size) {
 
     XML_SetElementHandler(
         xml_parser_.get(),
-        +[](void* user_data, const XML_Char* name, const XML_Char **atts) {
+        +[](void* user_data, const XML_Char* name, const XML_Char** atts) {
           const auto context = static_cast<Context*>(user_data);
           context->wrap_exception([=] { context->start_element(name, atts); });
         },
@@ -186,15 +262,14 @@ void Context::put(const void* buf, size_t size) {
         });
 
     XML_SetCharacterDataHandler(
-        xml_parser_.get(),
-        +[](void* user_data, const XML_Char* s, int len) {
+        xml_parser_.get(), +[](void* user_data, const XML_Char* s, int len) {
           const auto context = static_cast<Context*>(user_data);
           context->wrap_exception([=] { context->character_data(s, len); });
         });
   }
 
   CHECK_EXPAT(
-      XML_Parse(xml_parser_.get(), static_cast<const char *>(buf), size, 0));
+      XML_Parse(xml_parser_.get(), static_cast<const char*>(buf), size, 0));
 }
 
 void Context::start_element(const XML_Char* name, const XML_Char** atts) {
@@ -202,31 +277,131 @@ void Context::start_element(const XML_Char* name, const XML_Char** atts) {
   auto out_element = Element::Unknown;
   if (element_it != tag_to_element_s.end()) {
     switch (element_it->second) {
-    case Element::Root:
-      if (stack_.empty()) out_element = Element::Root;
-      break;
+      case Element::Form:
+        if (!stack_.empty() && stack_.back() == Element::Root) {
+          out_element = Element::Form;
 
-    case Element::Line:
-      if (!stack_.empty() && stack_.back() == Element::Root)
-        out_element = Element::Line;
-      break;
+          for (size_t attr_idx = 0; atts[attr_idx]; attr_idx += 2) {
+            const auto attr_name = atts[attr_idx];
+            const auto attr_value = atts[attr_idx + 1];
 
-    case Element::Prompt:
-      if (has_prompt_) throw std::runtime_error{"multiple prompt elements"};
-      if (!stack_.empty() && stack_.back() == Element::Root) {
-        for (size_t attr_idx = 0; atts[attr_idx]; attr_idx += 2) {
-          if (0 == std::strcmp(atts[attr_idx], "action"))
-            action_ = atts[attr_idx + 1];
-          else if (0 == std::strcmp(atts[attr_idx], "method"))
-            method_ = atts[attr_idx + 1];
+            if (0 == std::strcmp(attr_name, "action"))
+              action_.assign(attr_value);
+            else if (0 == std::strcmp(attr_name, "method"))
+              method_.assign(attr_value);
+          }
         }
-        out_element = Element::Prompt;
-        has_prompt_ = true;
-      }
-      break;
+        break;
 
-    case Element::Unknown:
-      break;
+      case Element::Line:
+        if (!stack_.empty() && stack_.back() == Element::Root) {
+          out_element = Element::Line;
+          writer_stack_.emplace_back(std::make_unique<tty::StdoutWriter>());
+        }
+        break;
+
+      case Element::Prompt:
+        if (!stack_.empty() && stack_.back() == Element::Form) {
+          out_element = Element::Prompt;
+
+          const char* name = nullptr;
+          const char* filter_regex = nullptr;
+          const char* filter_message = nullptr;
+
+          for (size_t attr_idx = 0; atts[attr_idx]; attr_idx += 2) {
+            const auto attr_name = atts[attr_idx];
+            const auto attr_value = atts[attr_idx + 1];
+
+            if (0 == std::strcmp(attr_name, "filter-regex"))
+              filter_regex = attr_value;
+            else if (0 == std::strcmp(attr_name, "filter-message"))
+              filter_message = attr_value;
+            else if (0 == std::strcmp(attr_name, "name"))
+              name = attr_value;
+          }
+
+          if (!name) {
+            throw std::runtime_error{
+                "prompt element is missing name attribute"};
+          }
+
+          prompts_.emplace_back(name);
+
+          auto& prompt = prompts_.back();
+
+          if (filter_regex) {
+            prompt.filter_regex_str_.assign(filter_regex);
+            prompt.filter_regex_.assign(prompt.filter_regex_str_);
+          }
+
+          if (filter_message) prompt.filter_message_.assign(filter_message);
+
+          writer_stack_.emplace_back(
+              std::make_unique<tty::PromptWriter>(prompt.prompt_));
+        }
+        break;
+
+      case Element::Root:
+        if (stack_.empty()) out_element = Element::Root;
+        break;
+
+      case Element::Style:
+        if (!writer_stack_.empty()) {
+          auto& writer = *writer_stack_.back();
+
+          out_element = Element::Style;
+
+          auto new_style = writer.style_stack_.back();
+
+          for (size_t attr_idx = 0; atts[attr_idx]; attr_idx += 2) {
+            const auto attr_name = atts[attr_idx];
+            const auto attr_value = atts[attr_idx + 1];
+
+            if (0 == std::strcmp(attr_name, "bg")) {
+              new_style.bg_ = parse_color(attr_value);
+            } else if (0 == std::strcmp(attr_name, "bold")) {
+              if (0 == std::strcmp(attr_value, "0")) {
+                new_style.bold_ = false;
+              } else if (0 == std::strcmp(attr_value, "1")) {
+                new_style.bold_ = true;
+              } else {
+                throw std::runtime_error{
+                    string::cat("invalid bold attribute '", attr_value, "'")};
+              }
+            } else if (0 == std::strcmp(attr_name, "fg")) {
+              new_style.fg_ = parse_color(attr_value);
+            }
+          }
+
+          writer.transition(writer.style_stack_.back(), new_style);
+          writer.style_stack_.emplace_back(new_style);
+        }
+        break;
+
+      case Element::Var: {
+        const char* name = nullptr;
+        const char* value = nullptr;
+
+        for (size_t attr_idx = 0; atts[attr_idx]; attr_idx += 2) {
+          const auto attr_name = atts[attr_idx];
+          const auto attr_value = atts[attr_idx + 1];
+
+          if (0 == std::strcmp(attr_name, "name"))
+            name = attr_value;
+          else if (0 == std::strcmp(attr_name, "value"))
+            value = attr_value;
+        }
+
+        if (!name)
+          throw std::runtime_error{"var element is missing name attribute"};
+        if (!value)
+          throw std::runtime_error{"var element is missing value attribute"};
+
+        vars_.emplace_back(name, value);
+      } break;
+
+      case Element::Unknown:
+        break;
     }
   }
 
@@ -235,6 +410,31 @@ void Context::start_element(const XML_Char* name, const XML_Char** atts) {
 
 void Context::end_element(const XML_Char* name) {
   if (stack_.empty()) throw std::logic_error{"unexpected end element call"};
+  switch (stack_.back()) {
+    case Element::Line:
+      writer_stack_.pop_back();
+      std::cout << std::endl;
+      if (std::cout.bad())
+        throw std::runtime_error{"write to standard output failed"};
+      break;
+
+    case Element::Style: {
+      auto& writer = *writer_stack_.back();
+      writer.transition(writer.style_stack_.back(),
+                        writer.style_stack_[writer.style_stack_.size() - 2]);
+      writer.style_stack_.pop_back();
+    } break;
+
+    case Element::Prompt:
+      writer_stack_.pop_back();
+      break;
+
+    case Element::Form:
+    case Element::Root:
+    case Element::Var:
+    case Element::Unknown:
+      break;
+  }
   stack_.pop_back();
 }
 
@@ -242,17 +442,17 @@ void Context::character_data(const XML_Char* s, int len) {
   if (stack_.empty()) return;
 
   switch (stack_.back()) {
-  case Element::Line:
-    std::cout.write(s, len);
-    std::cout << std::endl;
-    if (std::cout.bad()) throw std::runtime_error{"write to standard output failed"};
-    break;
+    case Element::Line:
+    case Element::Prompt:
+    case Element::Style:
+      writer_stack_.back()->put(s, len);
+      break;
 
-  case Element::Prompt:
-    prompt_.append(s, len);
-    break;
-
-  default:;
+    case Element::Form:
+    case Element::Root:
+    case Element::Var:
+    case Element::Unknown:
+      break;
   }
 }
 

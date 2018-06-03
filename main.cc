@@ -58,10 +58,11 @@ int main(int argc, char** argv) try {
   const char* url = argv[optind++];
 
   auto context = std::make_unique<ttyml::Context>(url);
-  for (;;) {
-    auto next_context = context->next_context();
+
+  while (context && context->has_prompt()) {
+    context = context->next_context();
   }
-  ttyml::Context context{url};
+
 } catch (std::runtime_error& e) {
   std::cerr << "Fatal error: " << e.what() << '\n';
   return EXIT_FAILURE;

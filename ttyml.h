@@ -2,28 +2,48 @@
 
 #include <exception>
 #include <memory>
+#include <regex>
 #include <unordered_map>
 #include <vector>
 
 #include <curl/curl.h>
 #include <expat.h>
 
+#include "util/tty.h"
+
 namespace ttyml {
 
 class Context {
  public:
-  Context(const char* url, const char* method = "GET", const char* data = nullptr);
+  Context(const char* url, const char* method = "GET",
+          const char* data = nullptr);
 
-  bool has_prompt() const { return has_prompt_; }
+  bool has_prompt() const { return !prompts_.empty(); }
 
   std::unique_ptr<Context> next_context() const;
 
  private:
   enum class Element {
-    Root,
+    Form,
     Line,
     Prompt,
+    Root,
+    Style,
+    Var,
+
     Unknown,
+  };
+
+  struct Prompt {
+    Prompt(std::string name) : name_{std::move(name)} {}
+
+    const std::string name_;
+    std::string prompt_;
+
+    std::string filter_regex_str_;
+    std::regex filter_regex_;
+
+    std::string filter_message_;
   };
 
   static const std::unordered_map<std::string, Element> tag_to_element_s;
@@ -45,11 +65,12 @@ class Context {
   std::unique_ptr<XML_ParserStruct, decltype(&XML_ParserFree)> xml_parser_;
 
   std::vector<Element> stack_;
+  std::vector<std::unique_ptr<tty::Writer>> writer_stack_;
 
-  std::string prompt_;
-  bool has_prompt_ = false;
+  std::vector<std::pair<std::string, std::string>> vars_;
+  std::vector<Prompt> prompts_;
   std::string action_;
-  std::string method_;
+  std::string method_ = "GET";
 
   void put_header(const void* buf, size_t size);
   void put(const void* buf, size_t size);
